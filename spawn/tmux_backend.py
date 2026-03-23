@@ -59,7 +59,7 @@ class TmuxBackend(SpawnBackend):
 
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
 
-        # Build the command (without prompt — we'll send it via send-keys)
+        # Build the command (without prompt — we'll send it via send-keys for interactive CLIs)
         final_command = list(command)
         if skip_permissions:
             if _is_claude_command(command):
@@ -67,8 +67,8 @@ class TmuxBackend(SpawnBackend):
             elif _is_codex_command(command):
                 final_command.append("--dangerously-bypass-approvals-and-sandbox")
 
-        # Codex accepts prompt as a positional argument directly
-        if prompt and _is_codex_command(command):
+        # Codex and clawteam-agent accept prompt as a positional argument directly
+        if prompt and (_is_codex_command(command) or _is_clawteam_agent_command(command)):
             final_command.append(prompt)
 
         cmd_str = " ".join(shlex.quote(c) for c in final_command)
@@ -272,6 +272,14 @@ def _is_claude_command(command: list[str]) -> bool:
         return False
     cmd = command[0].rsplit("/", 1)[-1]  # basename
     return cmd in ("claude", "claude-code")
+
+
+def _is_clawteam_agent_command(command: list[str]) -> bool:
+    """Check if the command is a clawteam-agent invocation."""
+    if not command:
+        return False
+    cmd = command[0].rsplit("/", 1)[-1]  # basename
+    return cmd == "clawteam-agent"
 
 
 def _is_codex_command(command: list[str]) -> bool:

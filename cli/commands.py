@@ -1598,7 +1598,8 @@ def spawn_agent(
         backend, _ = get_effective("default_backend")
         backend = backend or "tmux"
     if not command:
-        command = ["claude"]
+        # Default to clawteam-agent (OpenClaw local agent) instead of claude
+        command = ["clawteam-agent"]
 
     _team = team or "default"
     _name = agent_name or f"agent-{uuid.uuid4().hex[:6]}"

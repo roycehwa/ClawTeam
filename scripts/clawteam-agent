@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+clawteam-agent - OpenClaw-based agent wrapper for ClawTeam
+Replaces claude/codex CLI for local multi-agent coordination
+
+This agent runs in a loop:
+1. Receives initial task on startup
+2. Executes task using OpenClaw local agent
+3. Reports results to ClawTeam mailbox
+4. Listens for new messages/commands
+5. Continues until shutdown signal
+"""
+
+import os
+import sys
+import json
+import subprocess
+import time
+import signal
+from pathlib import Path
+from typing import Optional
+
+# Add clawteam source to path
+_CLAWTEAM_ROOT = Path("/root/.openclaw/workspace/clawteam-src")
+if str(_CLAWTEAM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CLAWTEAM_ROOT))
+
+# ClawTeam imports for mailbox integration
+try:
+    from clawteam.team.mailbox import MailboxManager
+    from clawteam.team.models import MessageType
+    from clawteam.identity import AgentIdentity
+    CLAWTEAM_AVAILABLE = True
+except ImportError as e:
+    CLAWTEAM_AVAILABLE = False
+    print(f"[clawteam-agent] Warning: ClawTeam modules not available ({e}), running in standalone mode")
+
+
+class ClawTeamAgent:
+    """Agent that bridges OpenClaw with ClawTeam coordination."""
+    
+    def __init__(self):
+        self.agent_name = os.environ.get("CLAWTEAM_AGENT_NAME", f"agent-{os.getpid()}")
+        self.agent_id = os.environ.get("CLAWTEAM_AGENT_ID", f"id-{os.getpid()}")
+        self.team_name = os.environ.get("CLAWTEAM_TEAM_NAME", "default")
+        self.agent_type = os.environ.get("CLAWTEAM_AGENT_TYPE", "general-purpose")
+        self.workspace_dir = os.environ.get("CLAWTEAM_WORKSPACE_DIR", ".")
+        self.running = True
+        self.mailbox: Optional[MailboxManager] = None
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        
+    def _handle_signal(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        print(f"\n[clawteam-agent] Received signal {signum}, shutting down...")
+        self.running = False
+        
+    def _init_mailbox(self) -> bool:
+        """Initialize mailbox connection if available."""
+        if not CLAWTEAM_AVAILABLE:
+            return False
+        try:
+            self.mailbox = MailboxManager(self.team_name)
+            return True
+        except Exception as e:
+            print(f"[clawteam-agent] Mailbox init failed: {e}")
+            return False
+    
+    def _send_idle_notification(self):
+        """Notify leader that agent is idle and ready for work."""
+        if not self.mailbox:
+            return
+        try:
+            from clawteam.team.manager import TeamManager
+            leader = TeamManager.get_leader_name(self.team_name)
+            if leader:
+                self.mailbox.send(
+                    from_agent=self.agent_name,
+                    to=leader,
+                    msg_type=MessageType.idle,
+                    content=f"Agent {self.agent_name} is idle and ready for tasks"
+                )
+        except Exception as e:
+            print(f"[clawteam-agent] Failed to send idle: {e}")
+    
+    def _check_messages(self) -> list:
+        """Check for new messages in inbox."""
+        if not self.mailbox:
+            return []
+        try:
+            return self.mailbox.receive(self.agent_name, limit=5)
+        except Exception as e:
+            print(f"[clawteam-agent] Message check failed: {e}")
+            return []
+    
+    def _execute_with_openclaw(self, task: str) -> str:
+        """
+        Execute a task using OpenClaw local agent.
+        
+        This runs the task and returns the result.
+        """
+        session_id = f"{self.team_name}-{self.agent_name}-{int(time.time())}"
+        
+        # Change to workspace directory if specified
+        cwd = self.workspace_dir if os.path.isdir(self.workspace_dir) else "."
+        
+        # Build context-aware prompt
+        full_prompt = f"""You are {self.agent_name} (ID: {self.agent_id}), a {self.agent_type} agent in team '{self.team_name}'.
+
+Your current task:
+{task}
+
+Workspace: {cwd}
+Team: {self.team_name}
+Agent: {self.agent_name}
+
+Execute this task to the best of your ability. Use available tools as needed.
+"""
+        
+        cmd = [
+            "openclaw",
+            "agent",
+            "--local",
+            "--session-id", session_id,
+            "--message", full_prompt,
+            "--timeout", "300",  # 5 minute timeout per task
+            "--verbose", "on"
+        ]
+        
+        print(f"[clawteam-agent] Executing task: {task[:100]}...")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=360  # 6 minute hard timeout
+            )
+            
+            output = result.stdout
+            if result.stderr:
+                output += f"\n[stderr]: {result.stderr}"
+            
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+            
+            return output
+            
+        except subprocess.TimeoutExpired:
+            return "[Error: Task execution timed out after 6 minutes]"
+        except Exception as e:
+            return f"[Error: {e}]"
+    
+    def run(self, initial_task: Optional[str] = None):
+        """Main agent loop."""
+        print(f"[clawteam-agent] Starting {self.agent_name} ({self.agent_id}) in team '{self.team_name}'")
+        print(f"[clawteam-agent] Type: {self.agent_type}")
+        print(f"[clawteam-agent] Workspace: {self.workspace_dir}")
+        
+        # Initialize mailbox
+        has_mailbox = self._init_mailbox()
+        if has_mailbox:
+            print("[clawteam-agent] Mailbox connected")
+        else:
+            print("[clawteam-agent] Running in standalone mode (no mailbox)")
+        
+        # Execute initial task if provided
+        if initial_task:
+            print(f"\n[clawteam-agent] Processing initial task...")
+            result = self._execute_with_openclaw(initial_task)
+            print(f"\n{'='*50}")
+            print("TASK RESULT:")
+            print(result)
+            print(f"{'='*50}\n")
+            
+            # Send result to mailbox if available
+            if has_mailbox and self.mailbox:
+                try:
+                    self.mailbox.send(
+                        from_agent=self.agent_name,
+                        to="leader",
+                        content=f"Task completed. Result:\n{result[:2000]}"  # Truncate if too long
+                    )
+                except Exception as e:
+                    print(f"[clawteam-agent] Failed to send result: {e}")
+        
+        # Main loop - listen for messages
+        if has_mailbox:
+            print("[clawteam-agent] Entering message loop (Ctrl+C to exit)")
+            self._send_idle_notification()
+            
+            while self.running:
+                messages = self._check_messages()
+                
+                for msg in messages:
+                    print(f"[clawteam-agent] Received {msg.type} from {msg.from_agent}")
+                    
+                    if msg.type == MessageType.message and msg.content:
+                        # Execute task from message
+                        result = self._execute_with_openclaw(msg.content)
+                        # Reply with result
+                        self.mailbox.send(
+                            from_agent=self.agent_name,
+                            to=msg.from_agent,
+                            content=f"Result:\n{result[:2000]}"
+                        )
+                    
+                    elif msg.type == MessageType.shutdown_request:
+                        print("[clawteam-agent] Shutdown requested")
+                        self.running = False
+                        break
+                
+                if self.running:
+                    time.sleep(2)  # Poll interval
+        else:
+            print("[clawteam-agent] No mailbox - exiting after initial task")
+        
+        print("[clawteam-agent] Shutting down")
+
+
+def main():
+    # Handle --version flag
+    if len(sys.argv) > 1 and sys.argv[1] == "--version":
+        print("clawteam-agent 2.0.0 (OpenClaw Edition)")
+        return 0
+    
+    # Skip known flags that ClawTeam passes but we don't use directly
+    # These are for claude/codex compatibility
+    skip_args = {"--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox"}
+    filtered_args = [arg for arg in sys.argv[1:] if arg not in skip_args]
+    
+    # Collect prompt from arguments or stdin
+    prompt = None
+    if filtered_args:
+        # Check if it's a file path
+        arg = filtered_args[0]
+        if os.path.isfile(arg):
+            prompt = Path(arg).read_text()
+        else:
+            prompt = " ".join(filtered_args)
+    
+    # If no prompt from args, read from stdin
+    if not prompt:
+        try:
+            prompt = sys.stdin.read()
+        except KeyboardInterrupt:
+            return 130
+    
+    # Run the agent
+    agent = ClawTeamAgent()
+    agent.run(initial_task=prompt if prompt and prompt.strip() else None)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

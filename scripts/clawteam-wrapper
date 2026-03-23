@@ -1,0 +1,6 @@
+#!/bin/bash
+# clawteam wrapper script - runs directly from source
+
+CLAWTEAM_ROOT="/root/.openclaw/workspace/clawteam-src"
+export PYTHONPATH="${CLAWTEAM_ROOT}:${PYTHONPATH}"
+exec python3 -c "from clawteam.cli.commands import app; app()" "$@"
